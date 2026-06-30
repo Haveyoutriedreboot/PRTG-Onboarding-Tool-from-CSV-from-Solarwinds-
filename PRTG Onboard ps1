@@ -1,0 +1,266 @@
+# ============================================
+# PRTG Device Onboarding Script
+# ============================================
+
+# --- UPDATE THESE VALUES ---
+$PrtgServer   = "prtg.yourcompany.com"
+$PrtgUser     = "prtgadmin"
+$PrtgPassword = "YourPassword"
+$CsvPath      = "C:\path\to\devices.csv"
+$ProbeId      = 1
+$LogFolder    = "C:\path\to\logs"
+# ---------------------------
+
+# Sensor name translation table
+# Corrects common incorrect or legacy sensor type names automatically
+$sensorAliases = @{
+    "wmicpuload"     = "wmiprocessor"
+    "wmicpu"         = "wmiprocessor"
+    "wmilogicaldisk" = "wmivolume"
+    "wmiharddisk"    = "wmivolume"
+}
+
+# Start logging
+$LogFile = "$LogFolder\prtg_import_log_$(Get-Date -Format 'yyyy-MM-dd_HH-mm').txt"
+Start-Transcript -Path $LogFile
+Write-Host "Script started at $(Get-Date)" -ForegroundColor White
+
+# Connect to PRTG only if not already connected
+$existingClient = Get-PrtgClient -ErrorAction SilentlyContinue
+if ($existingClient) {
+    Write-Host "Already connected to PRTG server: $($existingClient.Server)" -ForegroundColor Cyan
+}
+else {
+    Write-Host "No active connection found, connecting to $PrtgServer..." -ForegroundColor Yellow
+    Connect-PrtgServer $PrtgServer (New-Credential $PrtgUser $PrtgPassword)
+    Write-Host "Connected successfully to $PrtgServer." -ForegroundColor Green
+}
+
+# Load CSV
+$devices = Import-Csv $CsvPath
+
+Write-Host "Loaded $($devices.Count) devices:"
+$devices | Format-Table -AutoSize
+
+foreach ($device in $devices) {
+
+    Write-Host "`n--- Processing: $($device.Name) ---" -ForegroundColor White
+
+    # --- DEFAULT GROUP TO 'Unknown' IF BLANK ---
+    if ([string]::IsNullOrWhiteSpace($device.Group)) {
+        Write-Host "  No group specified for '$($device.Name)', defaulting to 'Unknown'." -ForegroundColor Yellow
+        $device.Group = "Unknown"
+    }
+
+    # --- FIND OR CREATE GROUP ---
+    $group = Get-Group -Name $device.Group | Select-Object -First 1
+
+    if (-not $group) {
+        try {
+            Write-Host "Creating missing group: $($device.Group)" -ForegroundColor Magenta
+            $probe = Get-Probe | Where-Object { $_.Id -eq $ProbeId }
+            $group = Add-Group -Destination $probe -Name $device.Group
+            Write-Host "Group '$($device.Group)' created successfully." -ForegroundColor Magenta
+        }
+        catch {
+            Write-Host "ERROR creating group '$($device.Group)': $($_.Exception.Message)" -ForegroundColor Red
+            continue
+        }
+    }
+
+    # --- FIND OR CREATE DEVICE ---
+    $existing = Get-Device -Name $device.Name | Where-Object { $_.ParentId -eq $group.Id }
+
+    if ($existing) {
+        Write-Host "Device '$($device.Name)' already exists, using existing device for credentials/sensors." -ForegroundColor Cyan
+        $newDevice = $existing
+    }
+    else {
+        try {
+            Write-Host "Adding: $($device.Name) ($($device.Host)) to $($device.Group)..." -ForegroundColor Green
+            $newDevice = Add-Device -Destination $group -Name $device.Name -Host $device.Host
+            Write-Host "SUCCESS: $($device.Name) added with ID $($newDevice.Id)" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "ERROR adding device '$($device.Name)': $($_.Exception.Message)" -ForegroundColor Red
+            continue
+        }
+    }
+
+    # --- SET CREDENTIALS ---
+    if ($device.CredentialType -eq "SNMP") {
+
+        $snmpVersion = $device.SNMPVersion.Trim().ToLower()
+
+        if ($snmpVersion -eq "v3") {
+            # --- SNMP v3 ---
+            try {
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPVersion -Value $device.SNMPVersion
+
+                # Username is always required for v3
+                if (-not [string]::IsNullOrWhiteSpace($device.SNMPv3User)) {
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3Username -Value $device.SNMPv3User
+                }
+
+                # Set security level and associated credentials
+                $secLevel = $device.SNMPv3SecurityLevel.Trim()
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3SecurityLevel -Value $secLevel
+
+                if ($secLevel -eq "authNoPriv" -or $secLevel -eq "authPriv") {
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3AuthType     -Value $device.SNMPv3AuthMethod
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3Password     -Value $device.SNMPv3AuthPassword
+                }
+
+                if ($secLevel -eq "authPriv") {
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3EncryptionType -Value $device.SNMPv3PrivMethod
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3EncryptionKey  -Value $device.SNMPv3PrivPassword
+                }
+
+                Write-Host "  SUCCESS: SNMP v3 credentials set (User: $($device.SNMPv3User), Level: $secLevel)." -ForegroundColor Green
+            }
+            catch {
+                Write-Host "  ERROR setting SNMP v3 credentials: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+        else {
+            # --- SNMP v1 / v2c ---
+            try {
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPCommunityStringV1 -Value $device.Community
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPCommunityStringV2 -Value $device.Community
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPVersion           -Value $device.SNMPVersion
+                Write-Host "  SUCCESS: SNMP credentials set (Community: $($device.Community), Version: $($device.SNMPVersion))." -ForegroundColor Green
+            }
+            catch {
+                Write-Host "  ERROR setting SNMP credentials: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+    }
+    elseif ($device.CredentialType -eq "WMI") {
+        try {
+            Set-ObjectProperty -Id $newDevice.Id -Property WindowsUserName -Value $device.WMIUser
+            Set-ObjectProperty -Id $newDevice.Id -Property WindowsPassword -Value $device.WMIPassword
+            Write-Host "  SUCCESS: WMI credentials set (User: $($device.WMIUser))." -ForegroundColor Green
+        }
+        catch {
+            Write-Host "  ERROR setting WMI credentials: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    elseif ($device.CredentialType -eq "ICMP") {
+        Write-Host "  INFO: ICMP device, no credentials needed." -ForegroundColor Cyan
+    }
+    elseif ($device.CredentialType -eq "Agent") {
+        Write-Host "  INFO: Agent-monitored device, no credentials needed." -ForegroundColor Cyan
+    }
+    else {
+        Write-Host "  WARNING: No valid CredentialType for '$($device.Name)'. Skipping credentials." -ForegroundColor Yellow
+    }
+
+    # --- ADD SENSORS ---
+    $sensorList = $device.Sensors -split "\|"
+
+    foreach ($sensorType in $sensorList) {
+
+        $sensorType = $sensorType.Trim()
+
+        # Apply translation if a known alias exists
+        if ($sensorAliases.ContainsKey($sensorType)) {
+            $correctedType = $sensorAliases[$sensorType]
+            Write-Host "  INFO: '$sensorType' translated to '$correctedType'." -ForegroundColor Cyan
+            $sensorType = $correctedType
+        }
+
+        if ($sensorType -eq "snmptraffic") {
+
+            Write-Host "  Discovering all active interfaces for SNMP Traffic..." -ForegroundColor Green
+
+            $prevPref = $ErrorActionPreference
+            $ErrorActionPreference = 'SilentlyContinue'
+            $params = $null
+            try {
+                $params = Get-Device -Id $newDevice.Id | New-SensorParameters -RawType $sensorType -Target *
+            }
+            catch {
+                Write-Host "  WARNING: Could not discover interfaces on '$($device.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+            finally {
+                $ErrorActionPreference = $prevPref
+            }
+
+            if ($null -eq $params) { continue }
+
+            if ($params.Targets -and $params.Targets.Count -gt 0) {
+
+                $filterInterfaces = @()
+                if (-not [string]::IsNullOrWhiteSpace($device.TrafficInterfaces)) {
+                    $filterInterfaces = $device.TrafficInterfaces -split "\|" | ForEach-Object { $_.Trim() }
+                    Write-Host "  Filtering to interfaces: $($filterInterfaces -join ', ')" -ForegroundColor Cyan
+                }
+                else {
+                    Write-Host "  No interface filter set, adding all available interfaces." -ForegroundColor Cyan
+                }
+
+                foreach ($target in $params.Targets["interfacenumber__check"]) {
+
+                    $interfaceNumber = $target.Name -replace '^\((\d+)\).*', '$1'
+
+                    if ($filterInterfaces.Count -gt 0 -and $interfaceNumber -notin $filterInterfaces) {
+                        Write-Host "  SKIPPED interface: $($target.Name)" -ForegroundColor Gray
+                        continue
+                    }
+
+                    try {
+                        $params["interfacenumber__check"] = $target
+                        Get-Device -Id $newDevice.Id | Add-Sensor -Parameters $params | Out-Null
+                        Write-Host "  SUCCESS: SNMP Traffic sensor added for interface: $($target.Name)." -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "  WARNING: Could not add SNMP Traffic for interface '$($target.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
+                }
+            }
+            else {
+                Write-Host "  WARNING: No interfaces found on '$($device.Name)'. Skipping SNMP Traffic." -ForegroundColor Yellow
+            }
+
+        }
+        else {
+
+            Write-Host "  Adding sensor: $sensorType..." -ForegroundColor Green
+
+            $prevPref = $ErrorActionPreference
+            $ErrorActionPreference = 'SilentlyContinue'
+            $params = $null
+            try {
+                $params = Get-Device -Id $newDevice.Id | New-SensorParameters -RawType $sensorType
+            }
+            catch {
+                Write-Host "  WARNING: Sensor '$sensorType' could not be queried on '$($device.Name)'. $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+            finally {
+                $ErrorActionPreference = $prevPref
+            }
+
+            if ($null -eq $params) { continue }
+
+            try {
+                Get-Device -Id $newDevice.Id | Add-Sensor -Parameters $params | Out-Null
+                Write-Host "  SUCCESS: '$sensorType' sensor added." -ForegroundColor Green
+            }
+            catch {
+                Write-Host "  WARNING: Sensor '$sensorType' could not be added to '$($device.Name)'. $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+    }
+
+    Write-Host "Completed: $($device.Name)." -ForegroundColor Cyan
+}
+
+Write-Host "`n--- Script finished at $(Get-Date) ---" -ForegroundColor White
+
+# Stop logging
+try {
+    Stop-Transcript
+}
+catch {
+    # Transcript already stopped automatically, nothing to worry about
+}
