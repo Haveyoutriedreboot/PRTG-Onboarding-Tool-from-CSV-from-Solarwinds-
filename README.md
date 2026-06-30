@@ -1,6 +1,5 @@
 # PRTG-Onboarding-Tool-from-CSV-from-Solarwinds-
 Bulk device onboarding for PRTG Network Monitor via CSV, built on PrtgAPI.
-# PRTG Device Onboarding Tool
 
 A PowerShell GUI tool for bulk onboarding devices into PRTG Network Monitor using a CSV file. Instead of adding devices one by one through the PRTG web interface, you fill in a CSV with your device names, hosts, groups, credentials, and sensors, then run this tool to create everything automatically.
 
