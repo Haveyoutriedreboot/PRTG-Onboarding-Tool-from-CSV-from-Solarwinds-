@@ -1,725 +1,266 @@
 # ============================================
-# PRTG Device Onboarding Tool - GUI Version
+# PRTG Device Onboarding Script
 # ============================================
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+# --- UPDATE THESE VALUES ---
+$PrtgServer   = "prtg.yourcompany.com"
+$PrtgUser     = "prtgadmin"
+$PrtgPassword = "YourPassword"
+$CsvPath      = "C:\path\to\devices.csv"
+$ProbeId      = 1
+$LogFolder    = "C:\path\to\logs"
+# ---------------------------
 
-# ============================================
-# MAIN FORM
-# ============================================
-
-$form                  = New-Object System.Windows.Forms.Form
-$form.Text             = "PRTG Device Onboarding Tool"
-$form.Size             = New-Object System.Drawing.Size(620, 740)
-$form.StartPosition    = "CenterScreen"
-$form.BackColor        = [System.Drawing.Color]::FromArgb(245, 245, 245)
-$form.FormBorderStyle  = "FixedSingle"
-$form.MaximizeBox      = $false
-$form.Font             = New-Object System.Drawing.Font("Segoe UI", 9)
-
-# ============================================
-# HEADER PANEL
-# ============================================
-
-$headerPanel            = New-Object System.Windows.Forms.Panel
-$headerPanel.Size       = New-Object System.Drawing.Size(620, 60)
-$headerPanel.Location   = New-Object System.Drawing.Point(0, 0)
-$headerPanel.BackColor  = [System.Drawing.Color]::FromArgb(31, 78, 121)
-$form.Controls.Add($headerPanel)
-
-$headerLabel            = New-Object System.Windows.Forms.Label
-$headerLabel.Text       = "PRTG Device Onboarding Tool"
-$headerLabel.ForeColor  = [System.Drawing.Color]::White
-$headerLabel.Font       = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
-$headerLabel.Location   = New-Object System.Drawing.Point(20, 12)
-$headerLabel.Size       = New-Object System.Drawing.Size(580, 36)
-$headerPanel.Controls.Add($headerLabel)
-
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
-
-function New-Label($text, $x, $y, $width = 150) {
-    $label           = New-Object System.Windows.Forms.Label
-    $label.Text      = $text
-    $label.Location  = New-Object System.Drawing.Point($x, $y)
-    $label.Size      = New-Object System.Drawing.Size($width, 22)
-    $label.ForeColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
-    $label.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-    return $label
+# Sensor name translation table
+# Corrects common incorrect or legacy sensor type names automatically
+$sensorAliases = @{
+    "wmicpuload"     = "wmiprocessor"
+    "wmicpu"         = "wmiprocessor"
+    "wmilogicaldisk" = "wmivolume"
+    "wmiharddisk"    = "wmivolume"
 }
 
-function New-TextBox($x, $y, $width = 380, $password = $false) {
-    $tb                  = New-Object System.Windows.Forms.TextBox
-    $tb.Location         = New-Object System.Drawing.Point($x, $y)
-    $tb.Size             = New-Object System.Drawing.Size($width, 26)
-    $tb.BorderStyle      = "FixedSingle"
-    $tb.BackColor        = [System.Drawing.Color]::White
-    if ($password) { $tb.PasswordChar = [char]0x2022 }
-    return $tb
+# Start logging
+$LogFile = "$LogFolder\prtg_import_log_$(Get-Date -Format 'yyyy-MM-dd_HH-mm').txt"
+Start-Transcript -Path $LogFile
+Write-Host "Script started at $(Get-Date)" -ForegroundColor White
+
+# Connect to PRTG only if not already connected
+$existingClient = Get-PrtgClient -ErrorAction SilentlyContinue
+if ($existingClient) {
+    Write-Host "Already connected to PRTG server: $($existingClient.Server)" -ForegroundColor Cyan
+}
+else {
+    Write-Host "No active connection found, connecting to $PrtgServer..." -ForegroundColor Yellow
+    Connect-PrtgServer $PrtgServer (New-Credential $PrtgUser $PrtgPassword) -IgnoreSSL
+    Write-Host "Connected successfully to $PrtgServer." -ForegroundColor Green
 }
 
-function New-Button($text, $x, $y, $width = 100, $height = 28) {
-    $btn                  = New-Object System.Windows.Forms.Button
-    $btn.Text             = $text
-    $btn.Location         = New-Object System.Drawing.Point($x, $y)
-    $btn.Size             = New-Object System.Drawing.Size($width, $height)
-    $btn.BackColor        = [System.Drawing.Color]::FromArgb(46, 117, 182)
-    $btn.ForeColor        = [System.Drawing.Color]::White
-    $btn.FlatStyle        = "Flat"
-    $btn.FlatAppearance.BorderSize = 0
-    $btn.Font             = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-    $btn.Cursor           = [System.Windows.Forms.Cursors]::Hand
-    return $btn
-}
+# Load CSV
+$devices = Import-Csv $CsvPath
 
-function Write-Log($message) {
-    $timestamp = Get-Date -Format "HH:mm:ss"
-    $logBox.AppendText("[$timestamp] $message`r`n")
-    $logBox.ScrollToCaret()
-    $form.Refresh()
-}
+Write-Host "Loaded $($devices.Count) devices:"
+$devices | Format-Table -AutoSize
 
-function Add-Warning($message) {
-    $script:warnings.Add($message) | Out-Null
-    Write-Log "  WARNING: $message"
-}
+foreach ($device in $devices) {
 
-function Test-SensorWarning($message) {
-    return (
-        $message -like "*null*"                        -or
-        $message -like "*not valid*"                   -or
-        $message -like "*resolve sensor targets*"      -or
-        $message -like "*Incomplete connection*"       -or
-        $message -like "*sensor query target*"         -or
-        $message -like "*credentials*"                 -or
-        $message -like "*not supported*"
-    )
-}
+    Write-Host "`n--- Processing: $($device.Name) ---" -ForegroundColor White
 
-# ============================================
-# FORM FIELDS
-# ============================================
-
-$yStart = 80
-
-# PRTG Server
-$form.Controls.Add((New-Label "PRTG Server:" 20 $yStart))
-$txtServer          = New-TextBox 175 ($yStart - 2)
-$txtServer.Text     = ""
-$form.Controls.Add($txtServer)
-
-# Username
-$y2 = $yStart + 45
-$form.Controls.Add((New-Label "Username:" 20 $y2))
-$txtUser            = New-TextBox 175 ($y2 - 2)
-$txtUser.Text       = ""
-$form.Controls.Add($txtUser)
-
-# Password
-$y3 = $y2 + 45
-$form.Controls.Add((New-Label "Password:" 20 $y3))
-$txtPass            = New-TextBox 175 ($y3 - 2) 380 $true
-$form.Controls.Add($txtPass)
-
-# Probe ID
-$y4 = $y3 + 45
-$form.Controls.Add((New-Label "Probe ID:" 20 $y4))
-$txtProbe           = New-TextBox 175 ($y4 - 2) 80
-$txtProbe.Text      = "1"
-$form.Controls.Add($txtProbe)
-
-# CSV File
-$y5 = $y4 + 45
-$form.Controls.Add((New-Label "CSV File:" 20 $y5))
-$txtCsv             = New-TextBox 175 ($y5 - 2) 300
-$txtCsv.Text        = ""
-$form.Controls.Add($txtCsv)
-
-$btnBrowseCsv       = New-Button "Browse" 483 ($y5 - 3) 80 28
-$btnBrowseCsv.Add_Click({
-    $dialog         = New-Object System.Windows.Forms.OpenFileDialog
-    $dialog.Filter  = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
-    $dialog.Title   = "Select your devices CSV file"
-    if ($dialog.ShowDialog() -eq "OK") {
-        $txtCsv.Text = $dialog.FileName
-    }
-})
-$form.Controls.Add($btnBrowseCsv)
-
-# Log Folder
-$y6 = $y5 + 45
-$form.Controls.Add((New-Label "Log Folder:" 20 $y6))
-$txtLog             = New-TextBox 175 ($y6 - 2) 300
-$txtLog.Text        = ""
-$form.Controls.Add($txtLog)
-
-$btnBrowseLog       = New-Button "Browse" 483 ($y6 - 3) 80 28
-$btnBrowseLog.Add_Click({
-    $dialog             = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dialog.Description = "Select folder for log files"
-    if ($dialog.ShowDialog() -eq "OK") {
-        $txtLog.Text = $dialog.SelectedPath
-    }
-})
-$form.Controls.Add($btnBrowseLog)
-
-# Existing Device Behaviour Dropdown
-$y7 = $y6 + 45
-$form.Controls.Add((New-Label "If device exists:" 20 $y7))
-
-$cboExisting               = New-Object System.Windows.Forms.ComboBox
-$cboExisting.Location      = New-Object System.Drawing.Point(175, ($y7 - 2))
-$cboExisting.Size          = New-Object System.Drawing.Size(388, 26)
-$cboExisting.DropDownStyle = "DropDownList"
-$cboExisting.BackColor     = [System.Drawing.Color]::White
-$cboExisting.Font          = New-Object System.Drawing.Font("Segoe UI", 9)
-[void]$cboExisting.Items.Add("Skip existing devices and sensors (safest)")
-[void]$cboExisting.Items.Add("Add missing sensors only (keep existing)")
-[void]$cboExisting.Items.Add("Overwrite credentials and re-add all sensors")
-$cboExisting.SelectedIndex = 0
-$form.Controls.Add($cboExisting)
-
-$descLabel           = New-Object System.Windows.Forms.Label
-$descLabel.Location  = New-Object System.Drawing.Point(175, ($y7 + 28))
-$descLabel.Size      = New-Object System.Drawing.Size(388, 18)
-$descLabel.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
-$descLabel.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
-$descLabel.Text      = "Recommended for first-time runs and production environments."
-$form.Controls.Add($descLabel)
-
-$cboExisting.Add_SelectedIndexChanged({
-    switch ($cboExisting.SelectedIndex) {
-        0 { $descLabel.Text = "Recommended for first-time runs and production environments." }
-        1 { $descLabel.Text = "Device credentials are updated. Only sensors not yet present are added." }
-        2 { $descLabel.Text = "All sensors are re-added and credentials overwritten. Use with caution." }
-    }
-})
-
-# ============================================
-# DIVIDER
-# ============================================
-
-$y8 = $y7 + 55
-
-$divider           = New-Object System.Windows.Forms.Panel
-$divider.Location  = New-Object System.Drawing.Point(20, $y8)
-$divider.Size      = New-Object System.Drawing.Size(572, 2)
-$divider.BackColor = [System.Drawing.Color]::FromArgb(46, 117, 182)
-$form.Controls.Add($divider)
-
-# ============================================
-# OUTPUT LOG BOX
-# ============================================
-
-$logLabel      = New-Label "Output Log:" 20 ($y8 + 12) 200
-$logLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($logLabel)
-
-$logBox             = New-Object System.Windows.Forms.RichTextBox
-$logBox.Location    = New-Object System.Drawing.Point(20, ($y8 + 34))
-$logBox.Size        = New-Object System.Drawing.Size(572, 180)
-$logBox.BackColor   = [System.Drawing.Color]::FromArgb(30, 30, 30)
-$logBox.ForeColor   = [System.Drawing.Color]::FromArgb(212, 212, 212)
-$logBox.Font        = New-Object System.Drawing.Font("Courier New", 8)
-$logBox.ReadOnly    = $true
-$logBox.BorderStyle = "None"
-$logBox.ScrollBars  = "Vertical"
-$form.Controls.Add($logBox)
-
-# ============================================
-# RUN AND CANCEL BUTTONS
-# ============================================
-
-$btnRun           = New-Button "Run Onboarding" 20 ($y8 + 226) 180 36
-$btnRun.Font      = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$btnRun.BackColor = [System.Drawing.Color]::FromArgb(31, 78, 121)
-
-$btnCancel             = New-Button "Cancel" 210 ($y8 + 226) 100 36
-$btnCancel.Font        = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$btnCancel.BackColor   = [System.Drawing.Color]::FromArgb(160, 50, 50)
-$btnCancel.Enabled     = $false
-$btnCancel.Add_Click({
-    $script:cancelRequested = $true
-    Write-Log ""
-    Write-Log "*** Cancellation requested by user ***"
-    $btnCancel.Enabled = $false
-})
-$form.Controls.Add($btnCancel)
-
-$statusLabel           = New-Object System.Windows.Forms.Label
-$statusLabel.Location  = New-Object System.Drawing.Point(325, ($y8 + 234))
-$statusLabel.Size      = New-Object System.Drawing.Size(267, 22)
-$statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
-$statusLabel.Text      = "Fill in all fields above and click Run."
-$form.Controls.Add($statusLabel)
-
-# ============================================
-# RUN BUTTON LOGIC
-# ============================================
-
-$btnRun.Add_Click({
-
-    # Validate inputs
-    if ([string]::IsNullOrWhiteSpace($txtServer.Text) -or
-        [string]::IsNullOrWhiteSpace($txtUser.Text) -or
-        [string]::IsNullOrWhiteSpace($txtPass.Text) -or
-        [string]::IsNullOrWhiteSpace($txtCsv.Text) -or
-        [string]::IsNullOrWhiteSpace($txtLog.Text)) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Please fill in all fields before running.",
-            "Missing Fields",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Warning
-        )
-        return
+    # --- DEFAULT GROUP TO 'Unknown' IF BLANK ---
+    if ([string]::IsNullOrWhiteSpace($device.Group)) {
+        Write-Host "  No group specified for '$($device.Name)', defaulting to 'Unknown'." -ForegroundColor Yellow
+        $device.Group = "Unknown"
     }
 
-    if (-not (Test-Path $txtCsv.Text)) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "CSV file not found. Please check the path.",
-            "File Not Found",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        )
-        return
-    }
+    # --- FIND OR CREATE GROUP ---
+    $group = Get-Group -Name $device.Group | Select-Object -First 1
 
-    if (-not (Test-Path $txtLog.Text)) {
-        New-Item -ItemType Directory -Path $txtLog.Text -Force | Out-Null
-    }
-
-    $btnRun.Enabled        = $false
-    $btnCancel.Enabled     = $true
-    $btnRun.Text           = "Running..."
-    $logBox.Clear()
-    $statusLabel.Text      = "Running..."
-    $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(46, 117, 182)
-
-    # Initialise state for this run
-    $script:warnings        = [System.Collections.Generic.List[string]]::new()
-    $script:cancelRequested = $false
-
-    $existingMode = $cboExisting.SelectedIndex
-    # 0 = Skip, 1 = Add missing sensors only, 2 = Overwrite
-
-    $PrtgServer   = $txtServer.Text.Trim()
-    $PrtgUser     = $txtUser.Text.Trim()
-    $PrtgPassword = $txtPass.Text
-    $CsvPath      = $txtCsv.Text.Trim()
-    $ProbeId      = $txtProbe.Text.Trim()
-    $LogFolder    = $txtLog.Text.Trim()
-    $LogFile      = "$LogFolder\prtg_import_log_$(Get-Date -Format 'yyyy-MM-dd_HH-mm').txt"
-
-    # Sensor name translation table
-    $sensorAliases = @{
-        "wmicpuload"     = "wmiprocessor"
-        "wmicpu"         = "wmiprocessor"
-        "wmilogicaldisk" = "wmivolume"
-        "wmiharddisk"    = "wmivolume"
-    }
-
-    # ---- STEP 1: Check and install PrtgAPI ----
-    Write-Log "Checking if PrtgAPI is installed..."
-    if (-not (Get-Module -ListAvailable -Name PrtgAPI)) {
-        Write-Log "PrtgAPI not found. Installing now, please wait..."
+    if (-not $group) {
         try {
-            $tls = [Net.ServicePointManager]::SecurityProtocol
-            [Net.ServicePointManager]::SecurityProtocol = $tls -bor [Net.SecurityProtocolType]::Tls12
-            Install-Module PrtgAPI -Force -Scope CurrentUser -ErrorAction Stop
-            Write-Log "PrtgAPI installed successfully."
+            Write-Host "Creating missing group: $($device.Group)" -ForegroundColor Magenta
+            $probe = Get-Probe | Where-Object { $_.Id -eq $ProbeId }
+            $group = Add-Group -Destination $probe -Name $device.Group
+            Write-Host "Group '$($device.Group)' created successfully." -ForegroundColor Magenta
         }
         catch {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Failed to install PrtgAPI.`n`n$($_.Exception.Message)",
-                "Installation Error",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Error
-            )
-            Write-Log "ERROR: Failed to install PrtgAPI: $($_.Exception.Message)"
-            $statusLabel.Text      = "Failed - See log for details."
-            $statusLabel.ForeColor = [System.Drawing.Color]::Red
-            $btnRun.Enabled        = $true
-            $btnCancel.Enabled     = $false
-            $btnRun.Text           = "Run Onboarding"
-            return
+            Write-Host "ERROR creating group '$($device.Group)': $($_.Exception.Message)" -ForegroundColor Red
+            continue
         }
+    }
+
+    # --- FIND OR CREATE DEVICE ---
+    $existing = Get-Device -Name $device.Name | Where-Object { $_.ParentId -eq $group.Id }
+
+    if ($existing) {
+        Write-Host "Device '$($device.Name)' already exists, using existing device for credentials/sensors." -ForegroundColor Cyan
+        $newDevice = $existing
     }
     else {
-        Write-Log "PrtgAPI is already installed."
-    }
-
-    Import-Module PrtgAPI -ErrorAction SilentlyContinue
-
-    # ---- STEP 2: Connect to PRTG ----
-    Write-Log "Connecting to PRTG server: $PrtgServer..."
-    try {
-        $existingClient = Get-PrtgClient -ErrorAction SilentlyContinue
-        if ($existingClient) {
-            Write-Log "Already connected to: $($existingClient.Server)"
+        try {
+            Write-Host "Adding: $($device.Name) ($($device.Host)) to $($device.Group)..." -ForegroundColor Green
+            $newDevice = Add-Device -Destination $group -Name $device.Name -Host $device.Host
+            Write-Host "SUCCESS: $($device.Name) added with ID $($newDevice.Id)" -ForegroundColor Green
         }
-        else {
-            Connect-PrtgServer $PrtgServer (New-Credential $PrtgUser $PrtgPassword) -IgnoreSSL -ErrorAction Stop
-            Write-Log "Connected successfully to $PrtgServer."
+        catch {
+            Write-Host "ERROR adding device '$($device.Name)': $($_.Exception.Message)" -ForegroundColor Red
+            continue
         }
     }
-    catch {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Could not connect to PRTG server '$PrtgServer'.`n`nPlease check your server address and credentials.`n`n$($_.Exception.Message)",
-            "Connection Error",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        )
-        Write-Log "ERROR: Could not connect to PRTG: $($_.Exception.Message)"
-        $statusLabel.Text      = "Failed - See log for details."
-        $statusLabel.ForeColor = [System.Drawing.Color]::Red
-        $btnRun.Enabled        = $true
-        $btnCancel.Enabled     = $false
-        $btnRun.Text           = "Run Onboarding"
-        return
-    }
 
-    # ---- STEP 3: Load CSV ----
-    Write-Log "Loading CSV from: $CsvPath"
-    try {
-        $devices = Import-Csv $CsvPath -ErrorAction Stop
-        Write-Log "Loaded $($devices.Count) device(s) from CSV."
-    }
-    catch {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Could not load CSV file.`n`n$($_.Exception.Message)",
-            "CSV Error",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        )
-        Write-Log "ERROR: Could not load CSV: $($_.Exception.Message)"
-        $statusLabel.Text      = "Failed - See log for details."
-        $statusLabel.ForeColor = [System.Drawing.Color]::Red
-        $btnRun.Enabled        = $true
-        $btnCancel.Enabled     = $false
-        $btnRun.Text           = "Run Onboarding"
-        return
-    }
+    # --- SET CREDENTIALS ---
+    if ($device.CredentialType -eq "SNMP") {
 
-    # Log the selected mode
-    $modeLabels = @(
-        "Skip existing devices and sensors",
-        "Add missing sensors only",
-        "Overwrite credentials and re-add all sensors"
-    )
-    Write-Log "Existing device mode: $($modeLabels[$existingMode])"
+        $snmpVersion = $device.SNMPVersion.Trim().ToLower()
 
-    # ---- STEP 4: Process each device ----
-    foreach ($device in $devices) {
-
-        if ($script:cancelRequested) {
-            Write-Log "Onboarding cancelled by user."
-            break
-        }
-
-        Write-Log ""
-        Write-Log "--- Processing: $($device.Name) ---"
-
-        # Default group to 'Unknown' if blank
-        if ([string]::IsNullOrWhiteSpace($device.Group)) {
-            Add-Warning "No group specified for '$($device.Name)', defaulting to 'Unknown'."
-            $device.Group = "Unknown"
-        }
-
-        # Find or create group
-        $group = Get-Group -Name $device.Group | Select-Object -First 1
-        if (-not $group) {
+        if ($snmpVersion -eq "v3") {
+            # --- SNMP v3 ---
             try {
-                Write-Log "Creating missing group: $($device.Group)"
-                $probe = Get-Probe | Where-Object { $_.Id -eq $ProbeId }
-                $group = Add-Group -Destination $probe -Name $device.Group
-                Write-Log "Group '$($device.Group)' created successfully."
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPVersion -Value $device.SNMPVersion
+
+                # Username is always required for v3
+                if (-not [string]::IsNullOrWhiteSpace($device.SNMPv3User)) {
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3Username -Value $device.SNMPv3User
+                }
+
+                # Set security level and associated credentials
+                $secLevel = $device.SNMPv3SecurityLevel.Trim()
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3SecurityLevel -Value $secLevel
+
+                if ($secLevel -eq "authNoPriv" -or $secLevel -eq "authPriv") {
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3AuthType     -Value $device.SNMPv3AuthMethod
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3Password     -Value $device.SNMPv3AuthPassword
+                }
+
+                if ($secLevel -eq "authPriv") {
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3EncryptionType -Value $device.SNMPv3PrivMethod
+                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3EncryptionKey  -Value $device.SNMPv3PrivPassword
+                }
+
+                Write-Host "  SUCCESS: SNMP v3 credentials set (User: $($device.SNMPv3User), Level: $secLevel)." -ForegroundColor Green
             }
             catch {
-                Write-Log "ERROR creating group '$($device.Group)': $($_.Exception.Message)"
-                continue
-            }
-        }
-
-        # Find or create device based on selected mode
-        $existing = Get-Device -Name $device.Name | Where-Object { $_.ParentId -eq $group.Id }
-
-        if ($existing) {
-            if ($existingMode -eq 0) {
-                Write-Log "SKIPPED: '$($device.Name)' already exists. Skipping device and sensors."
-                Add-Warning "Device '$($device.Name)' already exists in '$($device.Group)' and was skipped."
-                continue
-            }
-            else {
-                Write-Log "Device '$($device.Name)' already exists (ID: $($existing.Id)). Applying mode: $($modeLabels[$existingMode])."
-                $newDevice = $existing
+                Write-Host "  ERROR setting SNMP v3 credentials: $($_.Exception.Message)" -ForegroundColor Red
             }
         }
         else {
+            # --- SNMP v1 / v2c ---
             try {
-                Write-Log "Adding: $($device.Name) ($($device.Host)) to $($device.Group)..."
-                $newDevice = Add-Device -Destination $group -Name $device.Name -Host $device.Host
-                Write-Log "SUCCESS: $($device.Name) added with ID $($newDevice.Id)"
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPCommunityStringV1 -Value $device.Community
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPCommunityStringV2 -Value $device.Community
+                Set-ObjectProperty -Id $newDevice.Id -Property SNMPVersion           -Value $device.SNMPVersion
+                Write-Host "  SUCCESS: SNMP credentials set (Community: $($device.Community), Version: $($device.SNMPVersion))." -ForegroundColor Green
             }
             catch {
-                Write-Log "ERROR adding '$($device.Name)': $($_.Exception.Message)"
-                continue
+                Write-Host "  ERROR setting SNMP credentials: $($_.Exception.Message)" -ForegroundColor Red
             }
         }
-
-        # --- SET CREDENTIALS ---
-        if ($device.CredentialType -eq "SNMP") {
-
-            $snmpVersion = $device.SNMPVersion.Trim().ToLower()
-
-            if ($snmpVersion -eq "v3") {
-                # --- SNMP v3 ---
-                try {
-                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPVersion -Value $device.SNMPVersion
-
-                    if (-not [string]::IsNullOrWhiteSpace($device.SNMPv3User)) {
-                        Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3Username -Value $device.SNMPv3User
-                    }
-
-                    $secLevel = $device.SNMPv3SecurityLevel.Trim()
-                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3SecurityLevel -Value $secLevel
-
-                    if ($secLevel -eq "authNoPriv" -or $secLevel -eq "authPriv") {
-                        Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3AuthType -Value $device.SNMPv3AuthMethod
-                        Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3Password  -Value $device.SNMPv3AuthPassword
-                    }
-
-                    if ($secLevel -eq "authPriv") {
-                        Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3EncryptionType -Value $device.SNMPv3PrivMethod
-                        Set-ObjectProperty -Id $newDevice.Id -Property SNMPv3EncryptionKey  -Value $device.SNMPv3PrivPassword
-                    }
-
-                    Write-Log "  SUCCESS: SNMP v3 credentials set (User: $($device.SNMPv3User), Level: $secLevel)."
-                }
-                catch {
-                    Write-Log "  ERROR setting SNMP v3 credentials: $($_.Exception.Message)"
-                }
-            }
-            else {
-                # --- SNMP v1 / v2c ---
-                try {
-                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPCommunityStringV1 -Value $device.Community
-                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPCommunityStringV2 -Value $device.Community
-                    Set-ObjectProperty -Id $newDevice.Id -Property SNMPVersion           -Value $device.SNMPVersion
-                    Write-Log "  SUCCESS: SNMP credentials set (Community: $($device.Community), Version: $($device.SNMPVersion))."
-                }
-                catch {
-                    Write-Log "  ERROR setting SNMP credentials: $($_.Exception.Message)"
-                }
-            }
+    }
+    elseif ($device.CredentialType -eq "WMI") {
+        try {
+            Set-ObjectProperty -Id $newDevice.Id -Property WindowsUserName -Value $device.WMIUser
+            Set-ObjectProperty -Id $newDevice.Id -Property WindowsPassword -Value $device.WMIPassword
+            Write-Host "  SUCCESS: WMI credentials set (User: $($device.WMIUser))." -ForegroundColor Green
         }
-        elseif ($device.CredentialType -eq "WMI") {
+        catch {
+            Write-Host "  ERROR setting WMI credentials: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    elseif ($device.CredentialType -eq "ICMP") {
+        Write-Host "  INFO: ICMP device, no credentials needed." -ForegroundColor Cyan
+    }
+    elseif ($device.CredentialType -eq "Agent") {
+        Write-Host "  INFO: Agent-monitored device, no credentials needed." -ForegroundColor Cyan
+    }
+    else {
+        Write-Host "  WARNING: No valid CredentialType for '$($device.Name)'. Skipping credentials." -ForegroundColor Yellow
+    }
+
+    # --- ADD SENSORS ---
+    $sensorList = $device.Sensors -split "\|"
+
+    foreach ($sensorType in $sensorList) {
+
+        $sensorType = $sensorType.Trim()
+
+        # Apply translation if a known alias exists
+        if ($sensorAliases.ContainsKey($sensorType)) {
+            $correctedType = $sensorAliases[$sensorType]
+            Write-Host "  INFO: '$sensorType' translated to '$correctedType'." -ForegroundColor Cyan
+            $sensorType = $correctedType
+        }
+
+        if ($sensorType -eq "snmptraffic") {
+
+            Write-Host "  Discovering all active interfaces for SNMP Traffic..." -ForegroundColor Green
+
+            $prevPref = $ErrorActionPreference
+            $ErrorActionPreference = 'SilentlyContinue'
+            $params = $null
             try {
-                Set-ObjectProperty -Id $newDevice.Id -Property WindowsUserName -Value $device.WMIUser
-                Set-ObjectProperty -Id $newDevice.Id -Property WindowsPassword -Value $device.WMIPassword
-                Write-Log "  SUCCESS: WMI credentials set (User: $($device.WMIUser))."
-            }
-            catch { Write-Log "  ERROR setting WMI credentials: $($_.Exception.Message)" }
-        }
-        elseif ($device.CredentialType -eq "ICMP") {
-            Write-Log "  INFO: ICMP device, no credentials needed."
-        }
-        elseif ($device.CredentialType -eq "Agent") {
-            Write-Log "  INFO: Agent-monitored device, no credentials needed."
-        }
-        else {
-            Add-Warning "No valid CredentialType for '$($device.Name)'. Credentials skipped."
-        }
-
-        # Get existing sensors for Add Missing mode
-        $existingSensorTypes = @()
-        if ($existingMode -eq 1 -and $existing) {
-            try {
-                $existingSensorTypes = Get-Sensor -Device $newDevice | ForEach-Object { $_.Type.ToLower() }
-                Write-Log "  Found $($existingSensorTypes.Count) existing sensor(s) on device."
+                $params = Get-Device -Id $newDevice.Id | New-SensorParameters -RawType $sensorType -Target *
             }
             catch {
-                Write-Log "  WARNING: Could not retrieve existing sensors. Will attempt to add all."
+                Write-Host "  WARNING: Could not discover interfaces on '$($device.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
             }
-        }
-
-        # Add sensors
-        $sensorList = $device.Sensors -split "\|"
-        foreach ($sensorType in $sensorList) {
-
-            if ($script:cancelRequested) { break }
-
-            $sensorType = $sensorType.Trim()
-
-            # Apply translation if a known alias exists
-            if ($sensorAliases.ContainsKey($sensorType)) {
-                $correctedType = $sensorAliases[$sensorType]
-                Write-Log "  INFO: '$sensorType' translated to '$correctedType'."
-                $sensorType = $correctedType
+            finally {
+                $ErrorActionPreference = $prevPref
             }
 
-            # Add Missing mode: skip sensor if it already exists
-            if ($existingMode -eq 1 -and $existing -and $existingSensorTypes -contains $sensorType.ToLower()) {
-                Write-Log "  SKIPPED sensor '$sensorType': already exists on '$($device.Name)'."
-                continue
-            }
+            if ($null -eq $params) { continue }
 
-            if ($sensorType -eq "snmptraffic") {
+            if ($params.Targets -and $params.Targets.Count -gt 0) {
 
-                Write-Log "  Discovering active interfaces for SNMP Traffic..."
-
-                $prevPref = $ErrorActionPreference
-                $ErrorActionPreference = 'SilentlyContinue'
-                $params = $null
-                try {
-                    $params = Get-Device -Id $newDevice.Id | New-SensorParameters -RawType $sensorType -Target *
-                }
-                catch {
-                    Add-Warning "Could not discover interfaces on '$($device.Name)': $($_.Exception.Message)"
-                }
-                finally {
-                    $ErrorActionPreference = $prevPref
-                }
-
-                if ($null -eq $params) { continue }
-
-                if ($params.Targets -and $params.Targets.Count -gt 0) {
-                    $filterInterfaces = @()
-                    if (-not [string]::IsNullOrWhiteSpace($device.TrafficInterfaces)) {
-                        $filterInterfaces = $device.TrafficInterfaces -split "\|" | ForEach-Object { $_.Trim() }
-                        Write-Log "  Filtering to interfaces: $($filterInterfaces -join ', ')"
-                    }
-                    else {
-                        Write-Log "  No filter set, adding all available interfaces."
-                    }
-
-                    foreach ($target in $params.Targets["interfacenumber__check"]) {
-                        if ($script:cancelRequested) { break }
-                        $interfaceNumber = $target.Name -replace '^\((\d+)\).*', '$1'
-                        if ($filterInterfaces.Count -gt 0 -and $interfaceNumber -notin $filterInterfaces) {
-                            Write-Log "  SKIPPED interface: $($target.Name)"
-                            continue
-                        }
-                        try {
-                            $params["interfacenumber__check"] = $target
-                            Get-Device -Id $newDevice.Id | Add-Sensor -Parameters $params | Out-Null
-                            Write-Log "  SUCCESS: SNMP Traffic added for: $($target.Name)."
-                        }
-                        catch {
-                            Add-Warning "Could not add SNMP Traffic for interface '$($target.Name)' on '$($device.Name)': $($_.Exception.Message)"
-                        }
-                    }
+                $filterInterfaces = @()
+                if (-not [string]::IsNullOrWhiteSpace($device.TrafficInterfaces)) {
+                    $filterInterfaces = $device.TrafficInterfaces -split "\|" | ForEach-Object { $_.Trim() }
+                    Write-Host "  Filtering to interfaces: $($filterInterfaces -join ', ')" -ForegroundColor Cyan
                 }
                 else {
-                    Add-Warning "No SNMP Traffic interfaces found on '$($device.Name)'. Device may be unreachable or SNMP not responding."
+                    Write-Host "  No interface filter set, adding all available interfaces." -ForegroundColor Cyan
                 }
 
+                foreach ($target in $params.Targets["interfacenumber__check"]) {
+
+                    $interfaceNumber = $target.Name -replace '^\((\d+)\).*', '$1'
+
+                    if ($filterInterfaces.Count -gt 0 -and $interfaceNumber -notin $filterInterfaces) {
+                        Write-Host "  SKIPPED interface: $($target.Name)" -ForegroundColor Gray
+                        continue
+                    }
+
+                    try {
+                        $params["interfacenumber__check"] = $target
+                        Get-Device -Id $newDevice.Id | Add-Sensor -Parameters $params | Out-Null
+                        Write-Host "  SUCCESS: SNMP Traffic sensor added for interface: $($target.Name)." -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "  WARNING: Could not add SNMP Traffic for interface '$($target.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
+                }
             }
             else {
-
-                Write-Log "  Adding sensor: $sensorType..."
-
-                $prevPref = $ErrorActionPreference
-                $ErrorActionPreference = 'SilentlyContinue'
-                $params = $null
-                try {
-                    $params = Get-Device -Id $newDevice.Id | New-SensorParameters -RawType $sensorType
-                }
-                catch {
-                    if (Test-SensorWarning $_.Exception.Message) {
-                        Add-Warning "Sensor '$sensorType' could not be queried on '$($device.Name)'. $($_.Exception.Message)"
-                    }
-                    else {
-                        Write-Log "  ERROR getting parameters for '$sensorType': $($_.Exception.Message)"
-                    }
-                }
-                finally {
-                    $ErrorActionPreference = $prevPref
-                }
-
-                if ($null -eq $params) { continue }
-
-                try {
-                    Get-Device -Id $newDevice.Id | Add-Sensor -Parameters $params | Out-Null
-                    Write-Log "  SUCCESS: '$sensorType' sensor added."
-                }
-                catch {
-                    if (Test-SensorWarning $_.Exception.Message) {
-                        Add-Warning "Sensor '$sensorType' could not be added to '$($device.Name)'. $($_.Exception.Message)"
-                    }
-                    else {
-                        Write-Log "  ERROR adding '$sensorType' sensor: $($_.Exception.Message)"
-                    }
-                }
+                Write-Host "  WARNING: No interfaces found on '$($device.Name)'. Skipping SNMP Traffic." -ForegroundColor Yellow
             }
+
         }
+        else {
 
-        Write-Log "Completed: $($device.Name)."
-    }
+            Write-Host "  Adding sensor: $sensorType..." -ForegroundColor Green
 
-    # ---- STEP 5: Save log ----
-    try {
-        $logBox.Text | Out-File -FilePath $LogFile -Encoding UTF8
-        Write-Log ""
-        Write-Log "Log saved to: $LogFile"
-    }
-    catch {
-        Write-Log "WARNING: Could not save log file: $($_.Exception.Message)"
-    }
+            $prevPref = $ErrorActionPreference
+            $ErrorActionPreference = 'SilentlyContinue'
+            $params = $null
+            try {
+                $params = Get-Device -Id $newDevice.Id | New-SensorParameters -RawType $sensorType
+            }
+            catch {
+                Write-Host "  WARNING: Sensor '$sensorType' could not be queried on '$($device.Name)'. $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+            finally {
+                $ErrorActionPreference = $prevPref
+            }
 
-    # ---- STEP 6: Print warnings summary ----
-    Write-Log ""
-    Write-Log "============================================"
-    if ($script:cancelRequested) {
-        Write-Log "SUMMARY: Run was cancelled by user."
-        if ($script:warnings.Count -gt 0) {
-            Write-Log "Warnings collected before cancellation: $($script:warnings.Count)"
-            $i = 1
-            foreach ($w in $script:warnings) {
-                Write-Log "  [$i] $w"
-                $i++
+            if ($null -eq $params) { continue }
+
+            try {
+                Get-Device -Id $newDevice.Id | Add-Sensor -Parameters $params | Out-Null
+                Write-Host "  SUCCESS: '$sensorType' sensor added." -ForegroundColor Green
+            }
+            catch {
+                Write-Host "  WARNING: Sensor '$sensorType' could not be added to '$($device.Name)'. $($_.Exception.Message)" -ForegroundColor Yellow
             }
         }
     }
-    elseif ($script:warnings.Count -eq 0) {
-        Write-Log "SUMMARY: Completed with no warnings."
-    }
-    else {
-        Write-Log "SUMMARY: Completed with $($script:warnings.Count) warning(s):"
-        $i = 1
-        foreach ($w in $script:warnings) {
-            Write-Log "  [$i] $w"
-            $i++
-        }
-    }
-    Write-Log "============================================"
-    Write-Log ""
-    Write-Log "--- Script finished at $(Get-Date) ---"
 
-    if ($script:cancelRequested) {
-        $statusLabel.Text      = "Cancelled by user - See log for details."
-        $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 50, 50)
-    }
-    elseif ($script:warnings.Count -gt 0) {
-        $statusLabel.Text      = "Completed with $($script:warnings.Count) warning(s) - See log for details."
-        $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(200, 120, 0)
-    }
-    else {
-        $statusLabel.Text      = "Completed successfully with no warnings."
-        $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 128, 0)
-    }
+    Write-Host "Completed: $($device.Name)." -ForegroundColor Cyan
+}
 
-    $btnRun.Enabled    = $true
-    $btnCancel.Enabled = $false
-    $btnRun.Text       = "Run Onboarding"
-})
+Write-Host "`n--- Script finished at $(Get-Date) ---" -ForegroundColor White
 
-$form.Controls.Add($btnRun)
-
-# ============================================
-# SHOW FORM
-# ============================================
-
-$form.Add_Shown({ $form.Activate() })
-[void]$form.ShowDialog()
+# Stop logging
+try {
+    Stop-Transcript
+}
+catch {
+    # Transcript already stopped automatically, nothing to worry about
+}
