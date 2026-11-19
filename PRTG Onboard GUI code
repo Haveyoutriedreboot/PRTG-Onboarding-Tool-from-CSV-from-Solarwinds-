@@ -360,7 +360,7 @@ $btnRun.Add_Click({
             Write-Log "Already connected to: $($existingClient.Server)"
         }
         else {
-            Connect-PrtgServer $PrtgServer (New-Credential $PrtgUser $PrtgPassword) -ErrorAction Stop
+            Connect-PrtgServer $PrtgServer (New-Credential $PrtgUser $PrtgPassword) -IgnoreSSL -ErrorAction Stop
             Write-Log "Connected successfully to $PrtgServer."
         }
     }
